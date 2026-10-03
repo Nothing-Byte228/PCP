@@ -1,260 +1,96 @@
 import os
 import sys
 import base64
-import subprocess
-import tempfile
 import argparse
+import subprocess
 from obfuscate import obfuscate_code
+from compiler import compile_launcher, compile_library, get_obfuscated_code_from_target
 
-def build_exe(script_path, output_file, requirements, min_version="3.10", windowed=False):
-    print(f"\033[96m:: Generating stable EXE with embedded {os.path.basename(script_path)}...\033[0m")
+def main():
+    parser = argparse.ArgumentParser(description="PCP: Python Code Packer (Modular Enterprise Architecture)")
+    parser.add_argument("script", help="Path to the main Python script")
+    parser.add_argument("-o", "--output", default="./dist/app.exe", help="Output execution file baseline path")
+    parser.add_argument("-r", "--reqs", nargs="*", default=[], help="Modules to check/install via pip")
+    parser.add_argument("-w", "--windowed", action="store_true", help="Hide console window (GUI mode, uses pythonw)")
+    parser.add_argument("--mode", choices=["all", "exe-only", "dll-only"], default="all", 
+                        help="Build configuration mode (default: all - generates both runner and version library)")
+    parser.add_argument("--py", default=None, 
+                        help="Specify target Python version (e.g., 311, 3.11) or full path to python.exe for cross-compilation")
 
-    if not os.path.exists(script_path):
-        print(f"\033[91m:: Error: {script_path} not found!\033[0m")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.script):
+        print(f"\033[91m:: Error: Source script '{args.script}' not found!\033[0m")
         sys.exit(1)
 
-    output_dir = os.path.dirname(output_file)
+    output_dir = os.path.dirname(args.output)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    if os.path.exists(output_file):
-        try: os.remove(output_file)
-        except Exception: pass
+    base_name, _ = os.path.splitext(os.path.basename(args.output))
 
-    # 1. Читаем код как текст и обфусцируем через твой модуль
-    with open(script_path, "r", encoding="utf-8") as f:
-        python_text_code = f.read()
+    # === АВТООПРЕДЕЛЕНИЕ И ОРАБОТКА ЦЕЛЕВОГО ИНТЕРПРЕТАТOРА ===
+    target_python_exe = "python"
+    py_ver_major = sys.version_info.major
+    py_ver_minor = sys.version_info.minor
 
-    try:
-        # Твоя функция возвращает payload, ключ и загрузчик
-        payload, key, runtime_stub = obfuscate_code(python_text_code)
-        
-        # Кодируем получившийся загрузчик в Base64 для C# строки
-        base64_runtime_code = base64.b64encode(runtime_stub.encode("utf-8")).decode("utf-8")
-    except Exception as e:
-        print(f"\033[91m:: Obfuscation failed: {e}\033[0m")
-        sys.exit(1)
-
-    reqs_formatted = ", ".join([f'"{req}"' for req in requirements])
-
-    # 2. Исходный код C# лаунчера
-    csharp_code = f"""using System;
-using System.Diagnostics;
-using System.IO;
-using System.Reflection;
-using System.Text;
-using System.Windows.Forms;
-
-class Launcher {{
-    private static readonly string[] Requirements = new string[] {{ {reqs_formatted} }};
-    private static readonly string MinPythonVersion = "{min_version}";
-    private static readonly string AppName = "PCP Runtime Error";
-
-    static int Main(string[] args) {{
-        Console.OutputEncoding = Encoding.UTF8;
-
-        string exePath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-        Directory.SetCurrentDirectory(exePath);
-
-        // 1. Проверяем наличие Python
-        if (!IsPythonInstalled()) {{
-            MessageBox.Show(
-                "Python is not installed or not found in your system PATH.\\n\\n" +
-                "Please download and install Python from: https://python.org",
-                AppName, MessageBoxButtons.OK, MessageBoxIcon.Error
-            );
-            return 1;
-        }}
-
-        // 2. Проверяем версию
-        if (!CheckVersion(MinPythonVersion)) {{
-            MessageBox.Show(
-                "Your Python version is too old.\\n" +
-                "Required version: >= " + MinPythonVersion,
-                AppName, MessageBoxButtons.OK, MessageBoxIcon.Error
-            );
-            return 1;
-        }}
-
-        // 3. Проверяем зависимости
-        if (Requirements.Length > 0) {{
-            if (!ManageDependencies(Requirements)) {{
-                MessageBox.Show(
-                    "Critical dependencies are missing and failed to install via pip.\\n" +
-                    "Please check your internet connection and try again.",
-                    AppName, MessageBoxButtons.OK, MessageBoxIcon.Error
-                );
-                return 1;
-            }}
-        }}
-
-        // 4. Декодируем и запускаем код
-        string base64Data = "{base64_runtime_code}";
-        byte[] data = Convert.FromBase64String(base64Data);
-        string pythonScript = Encoding.UTF8.GetString(data);
-
-        string tempScriptPath = Path.Combine(Path.GetTempPath(), "pcp_runtime_main.py");
-        
-        try {{
-            File.WriteAllText(tempScriptPath, pythonScript, Encoding.UTF8);
-        }} catch (Exception ex) {{
-            MessageBox.Show("Error creating runtime script:\\n" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return 1;
-        }}
-
-        string scriptArgs = "\\"" + tempScriptPath + "\\"";
-        if (args.Length > 0) {{
-            scriptArgs += " " + string.Join(" ", args);
-        }}
-
-        ProcessStartInfo startInfo = new ProcessStartInfo();
-        startInfo.FileName = "python.exe"; 
-        
-        // Если оконный режим, используем pythonw.exe, чтобы сам Python не вызывал консоль
-        if ({str(windowed).lower()}) {{
-            startInfo.FileName = "pythonw.exe";
-        }}
-
-        startInfo.Arguments = scriptArgs; 
-        startInfo.UseShellExecute = false;
-        startInfo.CreateNoWindow = {str(windowed).lower()}; 
-        startInfo.WorkingDirectory = exePath; 
-        startInfo.RedirectStandardError = true;
-
-        int exitCode = 0;
-        try {{
-            using (Process process = Process.Start(startInfo)) {{
-                if (process != null) {{
-                    string errors = process.StandardError.ReadToEnd();
-                    process.WaitForExit(); 
-                    exitCode = process.ExitCode;
-
-                    if (exitCode != 0 && !string.IsNullOrEmpty(errors)) {{
-                        MessageBox.Show(
-                            "An unhandled exception occurred during runtime:\\n\\n" + errors,
-                            AppName, MessageBoxButtons.OK, MessageBoxIcon.Error
-                        );
-                    }}
-                }}
-            }}
-        }} catch (Exception ex) {{
-            MessageBox.Show("Error launching Python:\\n" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            exitCode = 1;
-        }} finally {{
-            if (File.Exists(tempScriptPath)) {{
-                try {{ File.Delete(tempScriptPath); }} catch {{}}
-            }}
-        }}
-
-        return exitCode;
-    }}
-
-    static bool IsPythonInstalled() {{
-        try {{
-            ProcessStartInfo psi = new ProcessStartInfo("python", "--version") {{
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            }};
-            using (Process p = Process.Start(psi)) {{
-                p.WaitForExit();
-                return p.ExitCode == 0;
-            }}
-        }} catch {{ return false; }}
-    }}
-
-    static bool CheckVersion(string minVersion) {{
-        try {{
-            ProcessStartInfo psi = new ProcessStartInfo("python", "-c \\"import sys; print(f'{{sys.version_info.major}}.{{sys.version_info.minor}}')\\"") {{
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            }};
-            using (Process p = Process.Start(psi)) {{
-                string output = p.StandardOutput.ReadToEnd().Trim();
-                p.WaitForExit();
-                Version current = Version.Parse(output);
-                Version required = Version.Parse(minVersion);
-                return current >= required;
-            }}
-        }} catch {{ return false; }}
-    }}
-
-    static bool ManageDependencies(string[] modules) {{
-        foreach (string module in modules) {{
-            ProcessStartInfo checkPsi = new ProcessStartInfo("python", "-c \\"import " + module + "\\"") {{
-                UseShellExecute = false,
-                CreateNoWindow = true
-            }};
-            try {{
-                using (Process p = Process.Start(checkPsi)) {{
-                    p.WaitForExit();
-                    if (p.ExitCode == 0) continue;
-                }}
-            }} catch {{ return false; }}
-
-            Console.WriteLine(">> Missing dependency detected. Installing '" + module + "'...");
-            ProcessStartInfo pipPsi = new ProcessStartInfo("python", "-m pip install " + module + " --user --quiet") {{
-                UseShellExecute = false,
-                CreateNoWindow = false
-            }};
-            try {{
-                using (Process p = Process.Start(pipPsi)) {{
-                    p.WaitForExit();
-                    if (p.ExitCode != 0) return false;
-                }}
-            }} catch {{ return false; }}
-        }}
-        return true;
-    }}
-}}
-"""
-
-    csc_executable = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-    if not os.path.exists(csc_executable):
-        csc_executable = r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"
-
-    if not os.path.exists(csc_executable):
-        print("\033[91m:: Error: .NET Framework compiler (csc.exe) not found.\033[0m")
-        sys.exit(1)
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".cs", encoding="utf-8", delete=False) as temp_file:
-        temp_file.write(csharp_code)
-        temp_source_path = temp_file.name
-
-    try:
-        # Выбираем тип приложения в зависимости от флага windowed
-        target_type = "/target:winexe" if windowed else "/target:exe"
-
-        cmd = [
-            csc_executable, 
-            target_type, 
-            "/optimize", 
-            "/r:System.Windows.Forms.dll", 
-            f"/out:{output_file}", 
-            temp_source_path
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        if os.path.exists(temp_source_path):
-            os.remove(temp_source_path)
-
-        if result.returncode == 0 and os.path.exists(output_file):
-            size_kb = os.path.getsize(output_file) / 1024
-            print(f"\033[92m:: Success! {os.path.basename(output_file)} created.\033[0m")
-            print(f"\033[92m:: File size: ({size_kb:.1f} KB)\033[0m")
+    if args.py:
+        if os.path.exists(args.py) and args.py.endswith(".exe"):
+            # Если передан прямой путь к python.exe
+            target_python_exe = args.py
+            try:
+                version_out = subprocess.check_output(
+                    [target_python_exe, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"], 
+                    text=True
+                ).strip()
+                py_ver_major, py_ver_minor = map(int, version_out.split("."))
+            except Exception:
+                print(f"\033[33m>> Warning: Could not verify version of '{args.py}'. Using current host runtime.\033[0m")
         else:
-            print("\033[91m:: Error: Compilation failed.\033[0m")
-    except Exception as e:
-        print(f"\033[91m:: Error during compilation: {e}\033[0m")
+            # Если передана строка вида "311" или "3.11"
+            clean_ver = args.py.replace(".", "")
+            if len(clean_ver) >= 2:
+                py_ver_major = int(clean_ver[0])
+                py_ver_minor = int(clean_ver[1:])
+                # Формируем стандартную команду для Windows-лаунчера 'py'
+                target_python_exe = f"py -{py_ver_major}.{py_ver_minor}"
+
+    min_version_str = f"{py_ver_major}.{py_ver_minor}"
+    postfix_str = f"-cpython{py_ver_major}{py_ver_minor}"
+
+    # Формируем финальные пути сборки
+    final_exe_path = os.path.join(output_dir, f"{base_name}.exe") if output_dir else f"{base_name}.exe"
+    final_dll_path = os.path.join(output_dir, f"{base_name}{postfix_str}.dll") if output_dir else f"{base_name}{postfix_str}.dll"
+
+    print(f"\033[96m:: PCP [Modular Edition]: Starting build pipes for {os.path.basename(args.script)}...\033[0m")
+
+    # Слой 1. Сборка DLL и запуск обфускации через нужный интерпретатор
+    base64_runtime_code = ""
+    if args.mode in ["all", "dll-only"]:
+        print(f"\033[94m>> Compiling bytecode using target engine: '{target_python_exe}'...\033[0m")
+        try:
+            # Вызываем функцию кросс-компиляции из compiler.py
+            base64_runtime_code = get_obfuscated_code_from_target(target_python_exe, args.script)
+        except Exception as e:
+            print(f"\033[91m:: Obfuscation pipeline crash: {e}\033[0m")
+            sys.exit(1)
+
+    # Слой 2. Сборка модулей C#
+    success = True
+
+    if args.mode in ["all", "exe-only"]:
+        if not compile_launcher(final_exe_path, base_name, min_version_str, args.windowed):
+            success = False
+
+    if args.mode in ["all", "dll-only"]:
+        if not compile_library(final_dll_path, base64_runtime_code, args.reqs, min_version_str):
+            success = False
+
+    if success:
+        print("\033[92m:: Multi-component pipeline build task accomplished successfully!\033[0m")
+    else:
+        print("\033[91m:: Component build pipeline failed.\033[0m")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PCP: Python Code Packer")
-    parser.add_argument("script", help="Path to the main.py script")
-    parser.add_argument("-o", "--output", default="./dist/app.exe", help="Output EXE path")
-    parser.add_argument("-r", "--reqs", nargs="*", default=[], help="Modules to check/install")
-    parser.add_argument("--min-version", default="3.10", help="Minimum Python version")
-    parser.add_argument("-w", "--windowed", action="store_true", help="Hide console window (GUI mode, uses pythonw)")
-
-    args = parser.parse_args()
-    build_exe(args.script, args.output, args.reqs, args.min_version, args.windowed)
+    main()
