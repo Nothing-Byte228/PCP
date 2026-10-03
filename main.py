@@ -4,6 +4,7 @@ import base64
 import subprocess
 import tempfile
 import argparse
+from obfuscate import obfuscate_code
 
 def build_exe(script_path, output_file, requirements, min_version="3.10", windowed=False):
     print(f"\033[96m:: Generating stable EXE with embedded {os.path.basename(script_path)}...\033[0m")
@@ -20,10 +21,19 @@ def build_exe(script_path, output_file, requirements, min_version="3.10", window
         try: os.remove(output_file)
         except Exception: pass
 
-    # 1. Кодируем python-скрипт в Base64
-    with open(script_path, "rb") as f:
-        file_bytes = f.read()
-    base64_code = base64.b64encode(file_bytes).decode("utf-8")
+    # 1. Читаем код как текст и обфусцируем через твой модуль
+    with open(script_path, "r", encoding="utf-8") as f:
+        python_text_code = f.read()
+
+    try:
+        # Твоя функция возвращает payload, ключ и загрузчик
+        payload, key, runtime_stub = obfuscate_code(python_text_code)
+        
+        # Кодируем получившийся загрузчик в Base64 для C# строки
+        base64_runtime_code = base64.b64encode(runtime_stub.encode("utf-8")).decode("utf-8")
+    except Exception as e:
+        print(f"\033[91m:: Obfuscation failed: {e}\033[0m")
+        sys.exit(1)
 
     reqs_formatted = ", ".join([f'"{req}"' for req in requirements])
 
@@ -79,7 +89,7 @@ class Launcher {{
         }}
 
         // 4. Декодируем и запускаем код
-        string base64Data = "{base64_code}";
+        string base64Data = "{base64_runtime_code}";
         byte[] data = Convert.FromBase64String(base64Data);
         string pythonScript = Encoding.UTF8.GetString(data);
 
