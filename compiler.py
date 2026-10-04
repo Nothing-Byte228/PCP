@@ -17,7 +17,6 @@ def compile_launcher(output_exe, base_name, min_version, windowed):
     """Компилирует универсальный исполняемый файл-оболочку .exe"""
     csc_executable = get_csc_path()
     
-    # Форматируем шаблон лаунчера
     csharp_code = LAUNCHER_TEMPLATE.replace("[BASE_NAME]", base_name)
     csharp_code = csharp_code.replace("[MIN_VERSION]", min_version)
     csharp_code = csharp_code.replace("[WINDOWED_FLAG]", str(windowed).lower())
@@ -38,42 +37,37 @@ def compile_launcher(output_exe, base_name, min_version, windowed):
         return True
     return False
 
-def compile_library(output_dll, base64_runtime_code, requirements, min_version):
-    """Компилирует защищенную динамическую библиотеку .dll (/target:library)"""
+def compile_library(output_dll, files_map, main_script_name, requirements, current_py_version):
     csc_executable = get_csc_path()
     reqs_formatted = ", ".join([f'"{req}"' for req in requirements])
 
+    dict_elements = []
+    for fname, base64_stub in files_map.items():
+        dict_elements.append(f'{{ "{fname}", "{base64_stub}" }}')
+    dict_placeholder = ",\n            ".join(dict_elements)
+
     # Форматируем шаблон библиотеки
-    csharp_code = LIBRARY_TEMPLATE.replace("[BASE64_RUNTIME_CODE]", base64_runtime_code)
+    csharp_code = LIBRARY_TEMPLATE.replace("[FILES_DICTIONARY_PLACEHOLDER]", dict_placeholder)
+    csharp_code = csharp_code.replace("[MAIN_SCRIPT_NAME]", main_script_name)
     csharp_code = csharp_code.replace("[REQUIREMENTS_PLACEHOLDER]", reqs_formatted)
-    csharp_code = csharp_code.replace("[MIN_VERSION]", min_version)
+    
+    # Зашиваем СТРОГУЮ целевую версию для этой конкретной DLL (например, "3.13")
+    csharp_code = csharp_code.replace("[TARGET_VERSION]", current_py_version) 
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".cs", encoding="utf-8", delete=False) as temp_file:
         temp_file.write(csharp_code)
         temp_source_path = temp_file.name
 
-    # Ключевой флаг компиляции под динамическую библиотеку: /target:library
     cmd = [csc_executable, "/target:library", "/optimize", "/r:System.Windows.Forms.dll", f"/out:{output_dll}", temp_source_path]
-
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
     if os.path.exists(temp_source_path):
         os.remove(temp_source_path)
 
-    if result.returncode == 0 and os.path.exists(output_dll):
-        print(f"\033[92m:: Protected Code Library created -> {os.path.basename(output_dll)} ({os.path.getsize(output_dll)/1024:.1f} KB)\033[0m")
-        return True
-    return False
+    return result.returncode == 0 and os.path.exists(output_dll)
 
 def get_obfuscated_code_from_target(target_python, script_path):
-    """
-    Запускает целевой интерпретатор Python, чтобы он сам скомпилировал 
-    совместимый с ним байт-код и прогнал его через обфускатор.
-    """
-    import subprocess
-    import os
-    import sys
-    
-    # Скрипт-макрос, который выполнится внутри целевого Python
+    """Запускает целевой интерпретатор Python для генерации обфусцированного стаба"""
     macro = f"""
 import sys, base64
 sys.path.append(r'{os.path.dirname(os.path.abspath(__file__))}')
@@ -83,7 +77,6 @@ with open(r'{os.path.abspath(script_path)}', 'r', encoding='utf-8') as f:
 _, _, stub = obfuscate_code(code)
 print(base64.b64encode(stub.encode('utf-8')).decode('utf-8'))
 """
-    # Разносим команду в массив, если там есть пробелы (например, "py -3.11")
     cmd = target_python.split() if " " in target_python else [target_python]
     cmd.extend(["-c", macro])
     

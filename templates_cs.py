@@ -1,5 +1,3 @@
-# Универсальный базовый лаунчер (appname.exe), который сканирует свою папку,
-# находит подходящую под версию Python DLL-ку и запускает её через Reflection
 LAUNCHER_TEMPLATE = """using System;
 using System.Diagnostics;
 using System.IO;
@@ -22,56 +20,60 @@ class Launcher {
         // 2. Ищем все доступные модули кода (.dll) в текущей папке приложения
         Dictionary<string, string> availableLibraries = FindAvailableLibraries(exePath);
 
-        // 3. Выбираем лучшую пару
-        string bestVersion = null;
-        int maxVerValue = -1;
+        bool executed = false;
+        int exitCode = 1;
 
-        foreach (var libVer in availableLibraries.Keys) {
+        // Сортируем найденные версии библиотек по убыванию (например, сначала 314, затем 313)
+        var sortedVersions = new List<string>(availableLibraries.Keys);
+        sortedVersions.Sort((a, b) => b.CompareTo(a));
+
+        // 3. Пытаемся запустить лучшую подходящую пару
+        foreach (var libVer in sortedVersions) {
             if (installedPythonRuntimes.ContainsKey(libVer)) {
+                string targetDllPath = availableLibraries[libVer];
+                string pythonInterpreterExe = installedPythonRuntimes[libVer];
+
+                // Передаем параметры через окружение целевой DLL
+                Environment.SetEnvironmentVariable("PCP_PYTHON_EXE", pythonInterpreterExe);
+
                 try {
-                    int currentVerValue = int.Parse(libVer);
-                    if (currentVerValue > maxVerValue) {
-                        maxVerValue = currentVerValue;
-                        bestVersion = libVer;
-                    }
-                } catch {}
+                    Assembly assembly = Assembly.LoadFrom(targetDllPath);
+                    Type type = assembly.GetType("PythonLibrary.RuntimeContainer");
+                    if (type == null) continue;
+
+                    MethodInfo method = type.GetMethod("InvokeRuntime", BindingFlags.Static | BindingFlags.Public);
+                    if (method == null) continue;
+
+                    // Вызываем InvokeRuntime из C#-библиотеки
+                    exitCode = (int)method.Invoke(null, new object[] { args });
+
+                    // Код 99 — это сигнал от DLL, что версия интерпретатора не совпала с её байт-кодом.
+                    // В этом случае не падаем, а пробуем следующую доступную DLL в цикле.
+                    if (exitCode == 99) continue;
+
+                    executed = true;
+                    break; // Успешный старт, выходим из цикла перебора
+                }
+                catch {
+                    // Если DLL повреждена или заблокирована, пытаемся пойти дальше
+                    continue; 
+                }
             }
         }
 
-        if (string.IsNullOrEmpty(bestVersion)) {
+        // Если ни одна из библиотек не смогла инициализироваться с локальным Python
+        if (!executed) {
             string errorMessage = "Critical Error: Could not match any installed Python engine with available application modules.\\n\\n";
             if (availableLibraries.Count == 0) errorMessage += "-> No application libraries (*.dll) found.\\n";
             else errorMessage += "-> Found modules for Python: " + string.Join(", ", availableLibraries.Keys) + "\\n";
             if (installedPythonRuntimes.Count == 0) errorMessage += "-> No Python installation detected.\\n";
             else errorMessage += "-> Installed Python runtimes found: " + string.Join(", ", installedPythonRuntimes.Keys);
+            
             MessageBox.Show(errorMessage, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
 
-        string targetDllPath = availableLibraries[bestVersion];
-        string pythonInterpreterExe = installedPythonRuntimes[bestVersion];
-
-        // ПЕРЕДАЕМ ПАРАМЕТРЫ ЧЕРЕЗ ОКРУЖЕНИЕ (Железобетонный способ без багов сигнатуры)
-        Environment.SetEnvironmentVariable("PCP_MIN_VERSION", "[MIN_VERSION]");
-        Environment.SetEnvironmentVariable("PCP_WINDOWED", "[WINDOWED_FLAG]");
-        Environment.SetEnvironmentVariable("PCP_PYTHON_EXE", pythonInterpreterExe);
-
-        try {
-            Assembly assembly = Assembly.LoadFrom(targetDllPath);
-            Type type = assembly.GetType("PythonLibrary.RuntimeContainer");
-            if (type == null) return 1;
-
-            MethodInfo method = type.GetMethod("InvokeRuntime", BindingFlags.Static | BindingFlags.Public);
-            if (method == null) return 1;
-
-            // Передаем ровно ОДИН параметр (массив строк args) внутри массива объектов!
-            // Для рефлексии это идеальная структура из одного элемента
-            return (int)method.Invoke(null, new object[] { args });
-        }
-        catch (Exception ex) {
-            MessageBox.Show("Dynamic link pipeline runtime crash:\\n" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return 1;
-        }
+        return exitCode;
     }
 
     static Dictionary<string, string> FindAvailableLibraries(string path) {
@@ -90,7 +92,7 @@ class Launcher {
         string pathPythonVer = GetPythonVersionPath("python");
         if (!string.IsNullOrEmpty(pathPythonVer)) runtimes.Add(pathPythonVer, "python.exe");
 
-        string[] regPaths = { @"Software\Python\PythonCore", @"Software\WOW6432Node\Python\PythonCore" };
+        string[] regPaths = { @"Software\\Python\\PythonCore", @"Software\\WOW6432Node\\Python\\PythonCore" };
         RegistryKey[] hives = { Registry.CurrentUser, Registry.LocalMachine };
 
         foreach (var regPath in regPaths) {
@@ -101,7 +103,7 @@ class Launcher {
                         string cleanVer = verKey.Split('-')[0].Replace(".", "");
                         if (runtimes.ContainsKey(cleanVer)) continue;
 
-                        using (RegistryKey installKey = key.OpenSubKey(verKey + @"\InstallPath")) {
+                        using (RegistryKey installKey = key.OpenSubKey(verKey + @"\\InstallPath")) {
                             if (installKey == null) continue;
                             object exeDir = installKey.GetValue("");
                             if (exeDir != null) {
@@ -118,7 +120,7 @@ class Launcher {
 
     static string GetPythonVersionPath(string command) {
         try {
-            ProcessStartInfo psi = new ProcessStartInfo(command, "-c \\"import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')\\"") {
+            ProcessStartInfo psi = new ProcessStartInfo(command, "-c \\\"import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')\\\"") {
                 RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true
             };
             using (Process p = Process.Start(psi)) {
@@ -131,57 +133,69 @@ class Launcher {
 }
 """
 
-# Шаблон для динамических библиотек (appname-cpython313.dll)
+# Изменен под поддержку словаря файлов и автоматического воссоздания структуры
 LIBRARY_TEMPLATE = """using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Windows.Forms;
+using System.Collections.Generic;
 
 namespace PythonLibrary {
     public class RuntimeContainer {
         private static readonly string[] Requirements = new string[] { [REQUIREMENTS_PLACEHOLDER] };
-        private static readonly string Base64RuntimeCode = "[BASE64_RUNTIME_CODE]";
+        private static readonly string MainScriptName = "[MAIN_SCRIPT_NAME]";
         private static readonly string AppName = "PCP Runtime Engine";
 
-        // Сигнатура принимает ровно один параметр! Рефлексия C# 5 никогда тут не споткнется
+        // Словарь: ИмяФайла -> Base64 строка загрузочного стаба (заглушки)
+        private static readonly Dictionary<string, string> FilePayloads = new Dictionary<string, string>() {
+            [FILES_DICTIONARY_PLACEHOLDER]
+        };
+
         public static int InvokeRuntime(string[] args) {
             Console.OutputEncoding = Encoding.UTF8;
             string exePath = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
 
-            // Читаем параметры из окружения, переданные лаунчером
-            string minVersion = Environment.GetEnvironmentVariable("PCP_MIN_VERSION") ?? "3.10";
-            bool windowed = Convert.ToBoolean(Environment.GetEnvironmentVariable("PCP_WINDOWED") ?? "false");
+            // Читаем версию Python и настройки окна, которые подготовил лаунчер
             string pythonInterpreterExe = Environment.GetEnvironmentVariable("PCP_PYTHON_EXE") ?? "python.exe";
+            bool windowed = Convert.ToBoolean(Environment.GetEnvironmentVariable("PCP_WINDOWED") ?? "false");
 
-            if (!CheckVersion(minVersion)) {
-                MessageBox.Show(
-                    "Your Python version is too old.\\nRequired version is >= " + minVersion,
-                    AppName, MessageBoxButtons.OK, MessageBoxIcon.Error
-                );
-                return 1;
+            string targetVersion = "[TARGET_VERSION]"; 
+            if (!CheckExactVersion(targetVersion)) {
+                // Если рантайм не совпал с версией байт-кода, возвращаем 99 для перебора
+                return 99; 
             }
 
             if (Requirements.Length > 0 && !ManageDependencies(Requirements)) {
-                MessageBox.Show(
-                    "Critical dependencies are missing and failed to install via pip.\\nPlease check your internet connection.",
-                    AppName, MessageBoxButtons.OK, MessageBoxIcon.Error
-                );
+                MessageBox.Show("Critical dependencies are missing and failed to install via pip.", AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return 1;
             }
 
-            byte[] data = Convert.FromBase64String(Base64RuntimeCode);
-            string pythonScript = Encoding.UTF8.GetString(data);
-            string tempScriptPath = Path.Combine(Path.GetTempPath(), "pcp_runtime_main.py");
-
+            // Создаем изолированную временную папку для текущего сеанса рантайма
+            string sessionTempDir = Path.Combine(Path.GetTempPath(), "pcp_project_" + Guid.NewGuid().ToString("N"));
             try {
-                File.WriteAllText(tempScriptPath, pythonScript, Encoding.UTF8);
+                Directory.CreateDirectory(sessionTempDir);
             } catch (Exception ex) {
-                MessageBox.Show("Error creating runtime memory stub:\\n" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Error creating isolation runtime directory:\\n" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return 1;
             }
 
-            string scriptArgs = "\\"" + tempScriptPath + "\\"";
+            // Распаковываем все привязанные файлы проекта
+            foreach (var item in FilePayloads) {
+                string currentFilePath = Path.Combine(sessionTempDir, item.Key);
+                try {
+                    byte[] data = Convert.FromBase64String(item.Value);
+                    string pythonScript = Encoding.UTF8.GetString(data);
+                    File.WriteAllText(currentFilePath, pythonScript, Encoding.UTF8);
+                } catch (Exception ex) {
+                    MessageBox.Show("Error unpacking module " + item.Key + ":\\n" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    CleanDirectory(sessionTempDir);
+                    return 1;
+                }
+            }
+
+            string targetMainScript = Path.Combine(sessionTempDir, MainScriptName);
+            string scriptArgs = "\\"" + targetMainScript + "\\"";
             if (args.Length > 0) {
                 scriptArgs += " " + string.Join(" ", args);
             }
@@ -195,8 +209,14 @@ namespace PythonLibrary {
             startInfo.Arguments = scriptArgs;
             startInfo.UseShellExecute = false;
             startInfo.CreateNoWindow = windowed;
-            startInfo.WorkingDirectory = exePath;
+            startInfo.WorkingDirectory = exePath; // Рабочая папка остается оригинальной для логов/сохранений
             startInfo.RedirectStandardError = true;
+
+            // Добавляем путь к временной папке в PYTHONPATH, чтобы локальные импорты работали без швов
+            string currentPythonPath = Environment.GetEnvironmentVariable("PYTHONPATH") ?? "";
+            startInfo.EnvironmentVariables["PYTHONPATH"] = string.IsNullOrEmpty(currentPythonPath) 
+                ? sessionTempDir 
+                : sessionTempDir + Path.PathSeparator + currentPythonPath;
 
             int exitCode = 0;
             try {
@@ -217,19 +237,22 @@ namespace PythonLibrary {
                 exitCode = 1;
             }
             finally {
-                if (File.Exists(tempScriptPath)) {
-                    try { File.Delete(tempScriptPath); } catch {}
-                }
+                CleanDirectory(sessionTempDir);
             }
             return exitCode;
         }
 
-        static bool CheckVersion(string minVersion) {
+        static bool CheckExactVersion(string targetVersion) {
             try {
-                Version current = Version.Parse(GetPythonVersionStr());
-                Version required = Version.Parse(minVersion);
-                return current >= required;
+                // Проверяем на строгое соответствие "Major.Minor"
+                return GetPythonVersionStr() == targetVersion;
             } catch { return false; }
+        }
+
+        static void CleanDirectory(string path) {
+            if (Directory.Exists(path)) {
+                try { Directory.Delete(path, true); } catch {}
+            }
         }
 
         static string GetPythonVersionStr() {
